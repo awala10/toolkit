@@ -18,27 +18,35 @@ $Global:KnownPorts = @{
     443   = "HTTPS"
     445   = "SMB"
     1433  = "MSSQL"
-    2000  = "Cisco-SCCP"      # Cisco Skinny Client Control Protocol
-    3121  = "Xilinx-HW-Server" # Xilinx Hardware Server
+    2000  = "Cisco-SCCP"      
+    3121  = "Xilinx-HW-Server" 
     3389  = "RDP"
-    4440  = "Rundeck"          # Rundeck Automation Web Console
-    4444  = "Metasploit"       # Metasploit Default Reverse Shell Listener
-    5660  = "LogMeIn-Hamachi"  # Hamachi VPN Control Service
-    5800  = "VNC-HTTP"         # VNC Web Viewer over HTTP
+    4440  = "Rundeck"          
+    4444  = "Metasploit"       
+    5660  = " "  
+    5800  = "VNC-HTTP"         
     5900  = "VNC"
+    7361  = "RDP Alt"          
     8080  = "HTTP-Alt"
-    8443  = "HTTPS-Alt"        # Common Tomcat/Plesk SSL Console port
-    9055  = "Oracle-WebLogic"  # Oracle WebLogic Management Service
-    9903  = "Blackberry-Router" # Blackberry Enterprise Server Router
+    8443  = "HTTPS-Alt"        
+    9055  = "Oracle-WebLogic"  
+    9903  = "Blackberry-Router" 
 }
 
 # --- CENTRALIZED GLOBAL LIBRARIES ---
 function Get-IPRange {
     param ([string]$InputTarget)
 
+    if ([string]::IsNullOrWhiteSpace($InputTarget)) { return $null }
     $InputTarget = $InputTarget.Trim()
+    
     if ($InputTarget -notmatch '\b(?:\d{1,3}\.){1,3}\d{1,3}\b') {
         Write-Host "`n[CRITICAL ERROR]: '$InputTarget' is not a valid IPv4 format!" -ForegroundColor Red
+        return $null
+    }
+
+    if ($InputTarget -match '\b0\d+\b') {
+        Write-Host "`n[CRITICAL ERROR]: '$InputTarget' contains invalid leading zeros!" -ForegroundColor Red
         return $null
     }
 
@@ -84,6 +92,15 @@ function Get-ParsedPorts {
     return ($finalPorts | Select-Object -Unique)
 }
 
+function Assert-PortsFile {
+    $PortsFile = Join-Path $PSScriptRoot "ports.txt"
+    if (-not (Test-Path $PortsFile)) { 
+        Write-Host "[!] ports.txt missing. Auto-generating baseline profiles..." -ForegroundColor Yellow
+        "21`n22`n23`n80`n443`n445`n1433`n3389`n8080" | Out-File $PortsFile -Encoding ascii
+    }
+    return $PortsFile
+}
+
 # ========================================================================
 # INTEGRATED ENGINE FUNCTIONS
 # ========================================================================
@@ -95,15 +112,11 @@ function Invoke-PortScanner {
     $Timeout = 350   
     $MaxThreads = 64 
 
-    $PortsFile = Join-Path $PSScriptRoot "ports.txt"
-    if (-not (Test-Path $PortsFile)) { 
-        Write-Host "`n[CRITICAL ERROR] Missing ports.txt in the toolkit folder." -ForegroundColor Red
-        return 
-    }
+    $PortsFile = Assert-PortsFile
     $PortsArray = Get-ParsedPorts -Path $PortsFile
     if ($null -eq $PortsArray) {
         Write-Host "`n[CRITICAL ERROR] ports.txt contains no valid ports." -ForegroundColor Red
-        return
+        return $false
     }
     $PortsStringSerialized = $PortsArray -join ','
 
@@ -111,21 +124,20 @@ function Invoke-PortScanner {
     foreach ($Target in ($IPInput -split '[,\|]')) {
         if (-not [string]::IsNullOrWhiteSpace($Target)) {
             $ResolvedIPs = Get-IPRange -InputTarget $Target.Trim()
-            if ($ResolvedIPs) { $IPList.AddRange([string[]]$ResolvedIPs) }
+            if ($null -eq $ResolvedIPs) { return $false } 
+            $IPList.AddRange([string[]]$ResolvedIPs)
         }
     }
 
     $CleanIPList = $IPList | Select-Object -Unique
     if ($CleanIPList.Count -eq 0) {
         Write-Host "`n[CRITICAL ERROR] No valid scan targets generated." -ForegroundColor Red
-        return
+        return $false
     }
 
-    # --- SAFETY LIMIT GUARDRAIL (/23 threshold restriction) ---
     if ($CleanIPList.Count -gt 512) {
-        Write-Host "`n[CRITICAL SCOPE ERROR] Target range ($($CleanIPList.Count) IPs) exceeds permitted allocation boundaries!" -ForegroundColor Red
-        Write-Host "[!] Scanning networks broader than a /23 block is disabled to prevent resource exhaustion." -ForegroundColor Yellow
-        return
+        Write-Host "`n[CRITICAL SCOPE ERROR] Target range ($($CleanIPList.Count) IPs) exceeds permitted boundaries!" -ForegroundColor Red
+        return $false
     }
 
     Write-Host "[*] Analyzing network path latency..." -ForegroundColor DarkGray
@@ -150,98 +162,114 @@ function Invoke-PortScanner {
     $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $InitialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $LocalRunspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxThreads, $InitialSessionState, $Host)
-    $LocalRunspacePool.Open()
+    
+    try {
+        $LocalRunspacePool.Open()
 
-    $ScriptBlock = {
-        param($IP, $SerializedPorts, $Timeout)
-        $IpResult = [PSCustomObject]@{
-            IPAddress  = $IP
-            HostStatus = "UNREACHABLE"
-            OpenPorts  = [System.Collections.Generic.List[int]]::new()
-            Timestamp  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        }
-        $LocalPorts = [int[]]($SerializedPorts -split ',')
-
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        try {
-            $pingTask = $ping.SendPingAsync($IP, 550)
-            if ($pingTask -and $pingTask.Wait(550)) {
-                if ($pingTask.Result.Status -eq "Success") { $IpResult.HostStatus = "ONLINE" }
+        $ScriptBlock = {
+            param($IP, $SerializedPorts, $Timeout)
+            $IpResult = [PSCustomObject]@{
+                IPAddress  = $IP
+                HostStatus = "UNREACHABLE"
+                OpenPorts  = [System.Collections.Generic.List[int]]::new()
+                Timestamp  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
             }
-        } catch {} finally { $ping.Dispose() }
+            $LocalPorts = [int[]]($SerializedPorts -split ',')
 
-        $ParsedIP = [System.Net.IPAddress]::Parse($IP)
-        foreach ($Port in $LocalPorts) {
-            $socket = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp)
-            $socket.NoDelay = $true 
-            $socket.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+            $ping = New-Object System.Net.NetworkInformation.Ping
             try {
-                $endpoint = New-Object System.Net.IPEndPoint($ParsedIP, [int]$Port)
-                $ar = $socket.BeginConnect($endpoint, $null, $null)
-                if ($ar.AsyncWaitHandle.WaitOne($Timeout, $false)) {
-                    $socket.EndConnect($ar)
-                    $null = $IpResult.OpenPorts.Add($Port)
-                    if ($IpResult.HostStatus -eq "UNREACHABLE") { $IpResult.HostStatus = "PORT_ONLY" }
+                $pingTask = $ping.SendPingAsync($IP, 550)
+                if ($pingTask -and $pingTask.Wait(550)) {
+                    if ($pingTask.Result.Status -eq "Success") { $IpResult.HostStatus = "ONLINE" }
                 }
-                $ar.AsyncWaitHandle.Dispose()
-            } catch {} finally {
-                try { $socket.Shutdown([System.Net.Sockets.SocketShutdown]::Both) } catch {}
-                $socket.Close(); $socket.Dispose()
+            } catch {} finally { $ping.Dispose() }
+
+            $ParsedIP = [System.Net.IPAddress]::Parse($IP)
+            foreach ($Port in $LocalPorts) {
+                $socket = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp)
+                $socket.NoDelay = $true 
+                $socket.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+                try {
+                    $endpoint = New-Object System.Net.IPEndPoint($ParsedIP, [int]$Port)
+                    $ar = $socket.BeginConnect($endpoint, $null, $null)
+                    if ($ar.AsyncWaitHandle.WaitOne($Timeout, $false)) {
+                        $socket.EndConnect($ar)
+                        $null = $IpResult.OpenPorts.Add($Port)
+                        if ($IpResult.HostStatus -eq "UNREACHABLE") { $IpResult.HostStatus = "PORT_ONLY" }
+                    }
+                    $ar.AsyncWaitHandle.Dispose()
+                } catch {} finally {
+                    try { $socket.Shutdown([System.Net.Sockets.SocketShutdown]::Both) } catch {}
+                    $socket.Close(); $socket.Dispose()
+                }
             }
+            return $IpResult
         }
-        return $IpResult
-    }
 
-    $Jobs = New-Object System.Collections.Generic.List[object]
-    foreach ($IP in $CleanIPList) {
-        $PowerShell = [PowerShell]::Create().AddScript($ScriptBlock).AddArgument($IP).AddArgument($PortsStringSerialized).AddArgument($Timeout)
-        $PowerShell.RunspacePool = $LocalRunspacePool
-        $Jobs.Add([PSCustomObject]@{ Pipe = $PowerShell; Handle = $PowerShell.BeginInvoke() })
-        Start-Sleep -Milliseconds (Get-Random -Minimum $MinPacing -Maximum $MaxPacing)
-    }
+        $Jobs = New-Object System.Collections.Generic.List[object]
+        foreach ($IP in $CleanIPList) {
+            $PowerShell = [PowerShell]::Create().AddScript($ScriptBlock).AddArgument($IP).AddArgument($PortsStringSerialized).AddArgument($Timeout)
+            $PowerShell.RunspacePool = $LocalRunspacePool
+            $Jobs.Add([PSCustomObject]@{ Pipe = $PowerShell; Handle = $PowerShell.BeginInvoke() })
+            Start-Sleep -Milliseconds (Get-Random -Minimum $MinPacing -Maximum $MaxPacing)
+        }
 
-    $ScanResults = [System.Collections.Generic.List[object]]::new()
-    $TotalTargets = $CleanIPList.Count; $CompletedTargets = 0; $AliveHostsCount = 0
+        $ScanResults = [System.Collections.Generic.List[object]]::new()
+        $TotalTargets = $CleanIPList.Count; $CompletedTargets = 0; $AliveHostsCount = 0
 
-    while ($Jobs.Count -gt 0) {
-        $FinishedJobs = $Jobs | Where-Object { $_.Handle.IsCompleted }
-        foreach ($Job in $FinishedJobs) {
-            $item = $Job.Pipe.EndInvoke($Job.Handle)
-            $CompletedTargets++
-            if ($item) {
-                if ($item.HostStatus -eq "ONLINE" -or $item.HostStatus -eq "PORT_ONLY") {
-                    $AliveHostsCount++
-                    if ($item.OpenPorts.Count -gt 0) {
-                        
-                        # --- ENHANCED PORT/SERVICE DICTIONARY RESOLVER ---
-                        $FormattedPortsArray = foreach ($p in $item.OpenPorts) {
-                            if ($Global:KnownPorts.ContainsKey($p)) {
-                                "$p/$($Global:KnownPorts[$p])"
-                            } else {
-                                "$p"
+        while ($Jobs.Count -gt 0) {
+            $FinishedJobs = $Jobs | Where-Object { $_.Handle.IsCompleted }
+            foreach ($Job in $FinishedJobs) {
+                $item = $Job.Pipe.EndInvoke($Job.Handle)
+                $CompletedTargets++
+                if ($item) {
+                    if ($item.HostStatus -eq "ONLINE" -or $item.HostStatus -eq "PORT_ONLY") {
+                        $AliveHostsCount++
+                        if ($item.OpenPorts.Count -gt 0) {
+                            $FormattedPortsArray = foreach ($p in $item.OpenPorts) {
+                                if ($Global:KnownPorts.ContainsKey($p)) { "$p/$($Global:KnownPorts[$p])" } else { "$p" }
                             }
+                            $PortString = $FormattedPortsArray -join ", "
+                            
+                            $Tag = if ($item.HostStatus -eq "PORT_ONLY") { "[+ (FIREWALLED)]" } else { "[+] OPEN" }
+                            Write-Host "$Tag $($item.IPAddress): $PortString" -ForegroundColor Green
+                            foreach ($OpenPort in $item.OpenPorts) {
+                                $RowObj = [PSCustomObject]@{
+                                    IPAddress  = $item.IPAddress
+                                    HostStatus = $item.HostStatus
+                                    Port       = $OpenPort
+                                    PortStatus = "OPEN"
+                                    Timestamp  = $item.Timestamp
+                                }
+                                $null = $ScanResults.Add($RowObj)
+                            }
+                        } else {
+                            Write-Host "[*] ALIVE (ICMP): $($item.IPAddress)" -ForegroundColor Gray
+                            $RowObj = [PSCustomObject]@{
+                                IPAddress  = $item.IPAddress
+                                HostStatus = "ONLINE"
+                                Port       = "None"
+                                PortStatus = "CLOSED"
+                                Timestamp  = $item.Timestamp
+                            }
+                            $null = $ScanResults.Add($RowObj)
                         }
-                        $PortString = $FormattedPortsArray -join ", "
-                        
-                        $Tag = if ($item.HostStatus -eq "PORT_ONLY") { "[+ (FIREWALLED)]" } else { "[+] OPEN" }
-                        Write-Host "$Tag $($item.IPAddress): $PortString" -ForegroundColor Green
-                        foreach ($OpenPort in $item.OpenPorts) {
-                            $null = $ScanResults.Add([PSCustomObject]@{ IPAddress = $item.IPAddress; HostStatus = $item.HostStatus; Port = $OpenPort; PortStatus = "OPEN"; Timestamp = $item.Timestamp })
-                        }
-                    } else {
-                        Write-Host "[*] ALIVE (Ping Only): $($item.IPAddress)" -ForegroundColor Gray
-                        $null = $ScanResults.Add([PSCustomObject]@{ IPAddress = $item.IPAddress; HostStatus = "ONLINE"; Port = "None"; PortStatus = "CLOSED"; Timestamp = $item.Timestamp })
                     }
                 }
+                $Job.Pipe.Dispose(); $null = $Jobs.Remove($Job)
             }
-            $Job.Pipe.Dispose(); $null = $Jobs.Remove($Job)
+            $PercentComplete = [Math]::Round(($CompletedTargets / $TotalTargets) * 100)
+            $Host.UI.RawUI.WindowTitle = "Scan Status: $PercentComplete% complete"
+            Start-Sleep -Milliseconds 10
         }
-        $PercentComplete = [Math]::Round(($CompletedTargets / $TotalTargets) * 100)
-        $Host.UI.RawUI.WindowTitle = "Scan Status: $PercentComplete% complete [$CompletedTargets / $TotalTargets IPs]"
-        Start-Sleep -Milliseconds 10
+    }
+    finally {
+        if ($null -ne $LocalRunspacePool) {
+            $LocalRunspacePool.Close()
+            $LocalRunspacePool.Dispose()
+        }
     }
 
-    $LocalRunspacePool.Close(); $LocalRunspacePool.Dispose()
     $Stopwatch.Stop(); $ElapsedTime = "{0:mm\:ss}" -f $Stopwatch.Elapsed
     $DeadHosts = $TotalTargets - $AliveHostsCount
 
@@ -250,22 +278,199 @@ function Invoke-PortScanner {
     Write-Host "+----------------------------------------------+" -ForegroundColor Cyan
     Write-Host "|  Total IPs Targeted  : $TotalTargets"            -ForegroundColor White
     Write-Host "|  Hosts Responsive    : $AliveHostsCount"         -ForegroundColor Green
-    Write-Host "|  Hosts Unreachable   : $DeadHosts"               -ForegroundColor DarkGray
-    Write-Host "|  Scan Duration       : $ElapsedTime"             -ForegroundColor White
+    Write-Host "|  Hosts Unreachable   : $DeadHosts"                -ForegroundColor DarkGray
+    Write-Host "|  Scan Duration       : $ElapsedTime"              -ForegroundColor White
     Write-Host "+----------------------------------------------+" -ForegroundColor Cyan
 
     if ($ScanResults.Count -gt 0) {
         $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $TargetFolder = Join-Path $PSScriptRoot "report"
-        if (-not (Test-Path $TargetFolder)) { $null = New-Item -Path $TargetFolder -ItemType Directory -Force }
+        if (-not (Test-Path $TargetFolder)) { 
+            New-Item -Path $TargetFolder -ItemType Directory -Force | Out-Null
+        }
         $OutputFile = Join-Path $TargetFolder "scan_report_$Timestamp.csv"
         $ScanResults | Export-Csv -Path $OutputFile -NoTypeInformation
         Write-Host "[!] Spreadsheet Saved: $OutputFile`n" -ForegroundColor Yellow
-    } else {
-        Write-Host "[*] No open ports or active hosts logged.`n" -ForegroundColor DarkGray
+    }
+    [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+    return $true
+}
+
+function Invoke-PortScannerDte {
+    param([string]$IPInput)
+    $Host.UI.RawUI.WindowTitle = "Toolkit Engine // DTE Fast Scan"
+    
+    $Timeout = 300   
+    $MaxThreads = 64 
+
+    $PortsFile = Assert-PortsFile
+    $PortsArray = Get-ParsedPorts -Path $PortsFile
+    if ($null -eq $PortsArray) {
+        Write-Host "`n[CRITICAL ERROR] ports.txt contains no valid ports." -ForegroundColor Red
+        return $false
+    }
+    $PortsStringSerialized = $PortsArray -join ','
+
+    $IPList = [System.Collections.Generic.List[string]]::new()
+    foreach ($Target in ($IPInput -split '[,\|]')) {
+        if (-not [string]::IsNullOrWhiteSpace($Target)) {
+            $ResolvedIPs = Get-IPRange -InputTarget $Target.Trim()
+            if ($null -eq $ResolvedIPs) { return $false }
+            $IPList.AddRange([string[]]$ResolvedIPs)
+        }
     }
 
+    $CleanIPList = $IPList | Select-Object -Unique
+    if ($CleanIPList.Count -eq 0) {
+        Write-Host "`n[CRITICAL ERROR] No valid scan targets generated." -ForegroundColor Red
+        return $false
+    }
+
+    if ($CleanIPList.Count -gt 512) {
+        Write-Host "`n[CRITICAL SCOPE ERROR] Target range ($($CleanIPList.Count) IPs) exceeds permitted boundaries!" -ForegroundColor Red
+        return $false
+    }
+
+    Write-Host "Targeting $($CleanIPList.Count) total IPs [Mode: DTE Lightning Discovery]" -ForegroundColor Cyan
+    Write-Host "Scanning... (Press Ctrl+C to stop)`n" -ForegroundColor Yellow
+
+    $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $InitialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $LocalRunspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxThreads, $InitialSessionState, $Host)
+    
+    try {
+        $LocalRunspacePool.Open()
+
+        $ScriptBlock = {
+            param($IP, $SerializedPorts, $Timeout)
+            $IpResult = [PSCustomObject]@{
+                IPAddress  = $IP
+                HostStatus = "UNREACHABLE"
+                OpenPorts  = [System.Collections.Generic.List[int]]::new()
+                Timestamp  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            }
+            $LocalPorts = [int[]]($SerializedPorts -split ',')
+
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            $PingSuccess = $false
+            try {
+                $pingTask = $ping.SendPingAsync($IP, 450)
+                if ($pingTask -and $pingTask.Wait(450)) {
+                    if ($pingTask.Result.Status -eq "Success") { 
+                        $PingSuccess = $true
+                        $IpResult.HostStatus = "ONLINE"
+                    }
+                }
+            } catch {} finally { $ping.Dispose() }
+
+            if ($PingSuccess) {
+                return $IpResult
+            } else {
+                $ParsedIP = [System.Net.IPAddress]::Parse($IP)
+                foreach ($Port in $LocalPorts) {
+                    $socket = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp)
+                    $socket.NoDelay = $true 
+                    try {
+                        $endpoint = New-Object System.Net.IPEndPoint($ParsedIP, [int]$Port)
+                        $ar = $socket.BeginConnect($endpoint, $null, $null)
+                        if ($ar.AsyncWaitHandle.WaitOne($Timeout, $false)) {
+                            $socket.EndConnect($ar)
+                            $null = $IpResult.OpenPorts.Add($Port)
+                            $IpResult.HostStatus = "PORT_ONLY"
+                            $ar.AsyncWaitHandle.Dispose()
+                            break 
+                        }
+                        $ar.AsyncWaitHandle.Dispose()
+                    } catch {} finally {
+                        try { $socket.Shutdown([System.Net.Sockets.SocketShutdown]::Both) } catch {}
+                        $socket.Close(); $socket.Dispose()
+                    }
+                }
+            }
+            return $IpResult
+        }
+
+        $Jobs = New-Object System.Collections.Generic.List[object]
+        foreach ($IP in $CleanIPList) {
+            $PowerShell = [PowerShell]::Create().AddScript($ScriptBlock).AddArgument($IP).AddArgument($PortsStringSerialized).AddArgument($Timeout)
+            $PowerShell.RunspacePool = $LocalRunspacePool
+            $Jobs.Add([PSCustomObject]@{ Pipe = $PowerShell; Handle = $PowerShell.BeginInvoke() })
+            Start-Sleep -Milliseconds 15
+        }
+
+        $ScanResults = [System.Collections.Generic.List[object]]::new()
+        $TotalTargets = $CleanIPList.Count; $CompletedTargets = 0; $AliveHostsCount = 0
+
+        while ($Jobs.Count -gt 0) {
+            $FinishedJobs = $Jobs | Where-Object { $_.Handle.IsCompleted }
+            foreach ($Job in $FinishedJobs) {
+                $item = $Job.Pipe.EndInvoke($Job.Handle)
+                $CompletedTargets++
+                if ($item) {
+                    if ($item.HostStatus -eq "ONLINE") {
+                        $AliveHostsCount++
+                        Write-Host "[*] ALIVE [$AliveHostsCount Found] (Ping Only): $($item.IPAddress)" -ForegroundColor Gray
+                        $RowObj = [PSCustomObject]@{
+                            IPAddress  = $item.IPAddress
+                            HostStatus = "ONLINE"
+                            Port       = "None"
+                            PortStatus = "SKIPPED_ON_PING"
+                            Timestamp  = $item.Timestamp
+                        }
+                        $null = $ScanResults.Add($RowObj)
+                    } elseif ($item.HostStatus -eq "PORT_ONLY") {
+                        $AliveHostsCount++
+                        $p = $item.OpenPorts[0]
+                        $Mapping = if ($Global:KnownPorts.ContainsKey($p)) { "$p/$($Global:KnownPorts[$p])" } else { "$p" }
+                        Write-Host "[+ (DTE MATCH)] [$AliveHostsCount Found] $($item.IPAddress): Verified active via $Mapping" -ForegroundColor Green
+                        $RowObj = [PSCustomObject]@{
+                            IPAddress  = $item.IPAddress
+                            HostStatus = "FIREWALLED_DTE"
+                            Port       = $p
+                            PortStatus = "FIRST_MATCH_OPEN"
+                            Timestamp  = $item.Timestamp
+                        }
+                        $null = $ScanResults.Add($RowObj)
+                    }
+                }
+                $Job.Pipe.Dispose(); $null = $Jobs.Remove($Job)
+            }
+            $PercentComplete = [Math]::Round(($CompletedTargets / $TotalTargets) * 100)
+            $Host.UI.RawUI.WindowTitle = "DTE Status: $PercentComplete% complete"
+            Start-Sleep -Milliseconds 10
+        }
+    }
+    finally {
+        if ($null -ne $LocalRunspacePool) {
+            $LocalRunspacePool.Close()
+            $LocalRunspacePool.Dispose()
+        }
+    }
+
+    $Stopwatch.Stop(); $ElapsedTime = "{0:mm\:ss}" -f $Stopwatch.Elapsed
+    $DeadHosts = $TotalTargets - $AliveHostsCount
+
+    Write-Host "`n+----------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "|              DTE FAST SCAN SUMMARY           |" -ForegroundColor Cyan
+    Write-Host "+----------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "|  Total IPs Targeted  : $TotalTargets"            -ForegroundColor White
+    Write-Host "|  Total Active Assets : $AliveHostsCount"         -ForegroundColor Green
+    Write-Host "|  Unresponsive IPs    : $DeadHosts"                -ForegroundColor DarkGray
+    Write-Host "|  Scan Duration       : $ElapsedTime"              -ForegroundColor White
+    Write-Host "+----------------------------------------------+" -ForegroundColor Cyan
+
+    if ($ScanResults.Count -gt 0) {
+        $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $TargetFolder = Join-Path $PSScriptRoot "report"
+        if (-not (Test-Path $TargetFolder)) { 
+            New-Item -Path $TargetFolder -ItemType Directory -Force | Out-Null
+        }
+        $OutputFile = Join-Path $TargetFolder "dte_discovery_$Timestamp.csv"
+        $ScanResults | Export-Csv -Path $OutputFile -NoTypeInformation
+        Write-Host "[!] Asset Spreadsheet Saved: $OutputFile`n" -ForegroundColor Yellow
+    }
     [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+    return $true
 }
 
 function Invoke-BannerGrabber {
@@ -300,7 +505,6 @@ function Invoke-BannerGrabber {
         $payload = $null
         $isSsl = $false
 
-        # --- PROTOCOL EVALUATION ENGINE ---
         if ($PortNum -eq 80 -or $PortNum -eq 8080 -or $PortNum -eq 5660) {
             $httpRequest = "HEAD / HTTP/1.1`r`nHost: $IP`r`nConnection: Close`r`n`r`n"
             $payload = [System.Text.Encoding]::ASCII.GetBytes($httpRequest)
@@ -316,24 +520,21 @@ function Invoke-BannerGrabber {
             $sslStream.Write($payload, 0, $payload.Length)
 
         } elseif ($PortNum -eq 3389) {
-            $payload = [byte[]](0x03,0x00,0x00,0x13,0x0e,0xe0,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x08,0x00,0x03,0x00,0x00,0x00)
+            $hexString = "030000130EE000000000000100080003000000"
+            $payload = [byte[]] -split ($hexString -replace '..', '0x$& ')
             $stream.Write($payload, 0, $payload.Length)
 
         } elseif ($PortNum -eq 445) {
-            $payload = [byte[]](0x00,0x00,0x00,0x44,0xff,0x53,0x4d,0x42,0x72,0x00,0x00,0x00,0x00,0x18,0x53,0xc8,0x00,0x00,
-                                0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xfe,0x00,0x00,0x40,0x00,
-                                0x00,0x11,0x00,0x02,0x4e,0x54,0x20,0x4c,0x4d,0x20,0x30,0x2e,0x12,0x00,0x02,0x53,0x4d,0x42,
-                                0x20,0x32,0x2e,0x30,0x30,0x32,0x00,0x02,0x53,0x4d,0x42,0x20,0x32,0x2e,0x3f,0x3f,0x00)
+            $hexString = "00000044FF534D4272000000001853C80000000000000000000000000000FFFF00004000001100024E54204C4D20302E120002534D4220322E3030320002534D4220322E3F3F00"
+            $payload = [byte[]] -split ($hexString -replace '..', '0x$& ')
             $stream.Write($payload, 0, $payload.Length)
 
         } elseif ($PortNum -eq 1433) {
-            $payload = [byte[]](0x12,0x01,0x00,0x2f,0x00,0x00,0x01,0x00,0x00,0x00,0x1a,0x00,0x06,0x01,0x00,0x20,0x00,0x01,
-                                0x02,0x00,0x21,0x00,0x06,0x03,0x00,0x27,0x00,0x04,0xff,0x08,0x00,0x01,0x55,0x00,0x00,0x00,
-                                0x00,0x00,0x01,0x00,0xb8,0x0d,0x00,0x00,0x00,0x00,0x00)
+            $hexString = "1201002F0000010000001A0006010020000102002100060300270004FF0800015500000000000100B80D0000000000"
+            $payload = [byte[]] -split ($hexString -replace '..', '0x$& ')
             $stream.Write($payload, 0, $payload.Length)
         }
 
-        # --- READ RESPONSE LAYER ---
         $readBuffer = New-Object byte[] 2048
         $bytesRead = if ($isSsl) { $sslStream.Read($readBuffer, 0, $readBuffer.Length) } else { $stream.Read($readBuffer, 0, $readBuffer.Length) }
         
@@ -486,7 +687,9 @@ function Invoke-MtuCalculator {
     Write-Host "=================================================" -ForegroundColor Cyan
 
     $MtuReportFolder = Join-Path $PSScriptRoot "report"
-    if (-not (Test-Path $MtuReportFolder)) { $null = New-Item -Path $MtuReportFolder -ItemType Directory -Force }
+    if (-not (Test-Path $MtuReportFolder)) { 
+        New-Item -Path $MtuReportFolder -ItemType Directory -Force | Out-Null
+    }
 
     $MtuLogFile = Join-Path $MtuReportFolder "mtu_audit_log.csv"
     $LogEntry = [PSCustomObject]@{
@@ -506,6 +709,30 @@ function Invoke-MtuCalculator {
     Write-Host "[!] Results recorded to central log: $MtuLogFile`n" -ForegroundColor Yellow
 }
 
+function Invoke-QuickPing {
+    param([string]$Target)
+    $Host.UI.RawUI.WindowTitle = "Toolkit Engine // Quick Ping"
+    if ([string]::IsNullOrWhiteSpace($Target)) { return }
+    Write-Host "`n[*] Executing 4-packet diagnostic validation to $Target..." -ForegroundColor Cyan
+    & ping.exe -n 4 $Target
+}
+
+function Invoke-ContinuousPing {
+    param([string]$Target)
+    $Host.UI.RawUI.WindowTitle = "Toolkit Engine // Continuous Ping"
+    if ([string]::IsNullOrWhiteSpace($Target)) { return }
+    Write-Host "`n[*] Initiating persistent tracking tunnel to $Target. Use Ctrl+C to break loop.`n" -ForegroundColor Yellow
+    & ping.exe -t $Target
+}
+
+function Start-ErrorCountdown {
+    for ($i = 5; $i -gt 0; $i--) {
+        Write-Host "`rReturning to menu input selection in $i seconds... " -NoNewline -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+    }
+    Write-Host "`n"
+}
+
 # ========================================================================
 # UI COORDINATOR & MASTER MENU ENGINE
 # ========================================================================
@@ -515,26 +742,31 @@ function Show-Menu-Layout {
     Write-Host "                NETWORK TOOLKIT MASTER MENU             " -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  [1] Run Port Scanner (DEFAULT option in 5 seconds)" -ForegroundColor White
-    Write-Host "  [2] Run Banner Grabber (Port Connect)" -ForegroundColor White
-    Write-Host "  [3] Run MTU Test Script" -ForegroundColor White
-    Write-Host "  [4] Run Quick Ping Utility" -ForegroundColor White
-    Write-Host "  [5] Exit" -ForegroundColor White
+    Write-Host "  [1] Run Port Scanner" -ForegroundColor White
+    Write-Host "  [2] Run DTE Fast Scan" -ForegroundColor White
+    Write-Host "  [3] Run Banner Grabber" -ForegroundColor White
+    Write-Host "  [4] Run MTU Test Script" -ForegroundColor White
+    Write-Host "  [5] Run Quick Ping Utility" -ForegroundColor White
+    Write-Host "  [6] Run Continuous Ping Utility (-t)" -ForegroundColor White
+    Write-Host "  [7] Exit" -ForegroundColor White
     Write-Host ""
     Write-Host "========================================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
 while ($true) {
+    # Clear out trailing keystrokes from prior scans
+    while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) }
+
     $Host.UI.RawUI.WindowTitle = $Global:OriginalTitle
     Show-Menu-Layout
-    Write-Host "Select an option [1-5] (Defaulting to [1] in 5s): " -NoNewline
+    Write-Host "Select an option [1-7] (Defaulting to [1] in 5s): " -NoNewline
 
     $Selection = $null 
-    $Timeout = 5       
+    $MenuTimeout = 5       
     $KeyElapsed = 0
 
-    while ($KeyElapsed -lt ($Timeout * 10)) {
+    while ($KeyElapsed -lt ($MenuTimeout * 10)) {
         if ([Console]::KeyAvailable) {
             $KeyInfo = [Console]::ReadKey($true)
             $Selection = $KeyInfo.KeyChar
@@ -544,72 +776,95 @@ while ($true) {
         $KeyElapsed++
     }
 
-    if ($null -eq $Selection) { $Selection = "1" }
-    $ToolExecuted = $false
+    if ($null -eq $Selection) {
+        $Selection = "1"
+    }
 
     switch ($Selection) {
         "1" {
-            $ToolExecuted = $true
-            Write-Host "`n`n--------------------------------------------------------" -ForegroundColor Green
+            Show-Menu-Layout
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
             Write-Host "Launching Port Scanner..." -ForegroundColor Green
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $TargetNet = Read-Host "Enter Subnet/Range (e.g., 100.111.44.0/26)"
-            if (-not [string]::IsNullOrWhiteSpace($TargetNet)) {
-                Invoke-PortScanner -IPInput $TargetNet
-            }
+            
+            do {
+                # USING NATIVE READ-HOST: History recall via Up-Arrow works natively again.
+                $TargetInput = Read-Host "Enter Subnet/Range (or type 'b' to go back)"
+                
+                if ($TargetInput.Trim().ToLower() -eq "b" -or $TargetInput.Trim().ToLower() -eq "back" -or [string]::IsNullOrWhiteSpace($TargetInput)) { 
+                    break 
+                }
+                
+                $ScanStatus = Invoke-PortScanner -IPInput $TargetInput
+                if (-not $ScanStatus) { 
+                    Start-ErrorCountdown
+                    break 
+                }
+                Write-Host "`n"
+            } while ($true)
         }
         "2" {
-            $ToolExecuted = $true
-            Write-Host "`n`n--------------------------------------------------------" -ForegroundColor Green
-            Write-Host "Launching Banner Grabber..." -ForegroundColor Green
+            Show-Menu-Layout
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $GrabInput = Read-Host "Enter target and port (e.g., 10.10.1.1:3389)"
-            if (-not [string]::IsNullOrWhiteSpace($GrabInput)) {
-                $ParsedArgs = $GrabInput -split '[\s:]' | Where-Object { $_ }
-                if ($ParsedArgs.Count -ge 2) {
-                    Invoke-BannerGrabber -Target $ParsedArgs[0] -Port $ParsedArgs[1]
-                } else {
-                    Write-Host "[!] Format invalid. Use Target:Port layout." -ForegroundColor Red
+            Write-Host "Launching DTE Fast Scan..." -ForegroundColor Green
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            
+            do {
+                $TargetInput = Read-Host "Enter Discovery Target Subnet/Range (or type 'b' to go back)"
+                
+                if ($TargetInput.Trim().ToLower() -eq "b" -or $TargetInput.Trim().ToLower() -eq "back" -or [string]::IsNullOrWhiteSpace($TargetInput)) { 
+                    break 
                 }
-            }
+
+                $ScanStatus = Invoke-PortScannerDte -IPInput $TargetInput
+                if (-not $ScanStatus) { 
+                    Start-ErrorCountdown
+                    break
+                }
+                Write-Host "`n"
+            } while ($true)
         }
         "3" {
-            $ToolExecuted = $true
-            Write-Host "`n`n--------------------------------------------------------" -ForegroundColor Green
-            Write-Host "Launching MTU Test Script..." -ForegroundColor Green
+            Show-Menu-Layout
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $MtuTarget = Read-Host "Enter target IP to test MTU against"
-            if (-not [string]::IsNullOrWhiteSpace($MtuTarget)) {
-                Invoke-MtuCalculator -Target $MtuTarget
-            }
+            Write-Host "Launching Banner Grabber..." -ForegroundColor Green
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            $T = Read-Host "Enter Target IP"
+            $P = Read-Host "Enter Port Number"
+            Invoke-BannerGrabber -Target $T -Port $P
+            Read-Host "`nPress Enter to return to menu..."
         }
         "4" {
-            $ToolExecuted = $true
-            Write-Host "`n`n--------------------------------------------------------" -ForegroundColor Green
-            Write-Host "Launching Quick Ping Utility..." -ForegroundColor Green
+            Show-Menu-Layout
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $PingTarget = Read-Host "Enter target IP or Domain to ping"
-            if (-not [string]::IsNullOrWhiteSpace($PingTarget)) {
-                Write-Host "`nSending 4 ICMP echo requests to $PingTarget...`n" -ForegroundColor Yellow
-                & ping.exe $PingTarget.Trim()
-            }
+            Write-Host "Launching MTU Analyzer..." -ForegroundColor Green
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            $T = Read-Host "Enter Target IP for MTU Sweep"
+            Invoke-MtuCalculator -Target $T
+            Read-Host "`nPress Enter to return to menu..."
         }
         "5" {
-            Write-Host "`nExiting Suite Terminal..." -ForegroundColor Yellow
-            break 
+            Show-Menu-Layout
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            Write-Host "Launching Quick Ping..." -ForegroundColor Green
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            $T = Read-Host "Enter Target IP/Hostname for Quick Ping"
+            Invoke-QuickPing -Target $T
+            Read-Host "`nDiagnostic sequence concluded. Press Enter to return to menu..."
         }
-        Default {
-            Write-Host "`n`n[!] Invalid entry. Refreshing menu..." -ForegroundColor Red
-            Start-Sleep -Seconds 1
-            while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+        "6" {
+            Show-Menu-Layout
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            Write-Host "Launching Continuous Ping..." -ForegroundColor Green
+            Write-Host "--------------------------------------------------------" -ForegroundColor Green
+            $T = Read-Host "Enter Target IP/Hostname for Continuous Tracking"
+            Invoke-ContinuousPing -Target $T
+            Read-Host "`nPersistent tunnel stopped. Press Enter to return to menu..."
         }
-    }
-
-    if ($Selection -eq "5") { break }
-
-    if ($ToolExecuted) {
-        while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
-        Write-Host "`nPress any key to return to menu..." -ForegroundColor DarkGray
-        [Console]::ReadKey($true) | Out-Null
+        "7" {
+            Clear-Host
+            Write-Host "[*] Tearing down session variables... Goodbye.`n" -ForegroundColor Cyan
+            break
+        }
     }
 }
