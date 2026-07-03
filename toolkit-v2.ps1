@@ -23,7 +23,7 @@ $Global:KnownPorts = @{
     3389  = "RDP"
     4440  = "Rundeck"          
     4444  = "Metasploit"       
-    5660  = " "  
+    5660  = "LOTS (EP-ICE, Universal)"  
     5800  = "VNC-HTTP"         
     5900  = "VNC"
     7361  = "RDP Alt"          
@@ -75,6 +75,73 @@ function Get-IPRange {
     } else {
         if ([System.Net.IPAddress]::TryParse($InputTarget, [ref]$null)) { return $InputTarget }
         return $null
+    }
+}
+
+# Helper to automatically strip web prefix formats like http:// or https://
+function Sanitize-TargetString ([string]$Value) {
+    $Value = $Value.Trim()
+    if ($Value -match '^https?://([^/]+)') {
+        $Value = $Matches[1]
+    }
+    return $Value.Split(':')[0].Trim() # Drop explicit port tails like :8080 if accidentally pasted
+}
+
+# Validates single targets strictly (Hostnames, IPs - NO ranges, NO CIDR)
+function Get-ValidSingleTarget {
+    param ([string]$PromptMessage)
+    while ($true) {
+        $RawInput = Read-Host $PromptMessage
+        if ([string]::IsNullOrWhiteSpace($RawInput)) { return "back" }
+        $Cleaned = Sanitize-TargetString $RawInput
+        
+        if ($Cleaned.ToLower() -eq "b" -or $Cleaned.ToLower() -eq "back") { return "back" }
+
+        # Verify single IP structure boundaries
+        if ($Cleaned -match '^(\d{1,3}\.){3}\d{1,3}$') {
+            $Octets = $Cleaned -split '\.'
+            if ([int]$Octets[0] -le 255 -and [int]$Octets[1] -le 255 -and [int]$Octets[2] -le 255 -and [int]$Octets[3] -le 255) {
+                return $Cleaned
+            }
+        }
+        # Verify standard domain hostname framework rules
+        elseif ($Cleaned -match '^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$') {
+            return $Cleaned
+        }
+        Write-Host "[!] Invalid input. Provide one specific IPv4 address or clean standard Hostname domain." -ForegroundColor Red
+    }
+}
+
+# Validates scanning networks (Allows single IPs, ranges, CIDR blocks, comma-separated clusters)
+function Get-ValidNetworkInput {
+    param ([string]$PromptMessage)
+    while ($true) {
+        $RawInput = Read-Host $PromptMessage
+        if ([string]::IsNullOrWhiteSpace($RawInput)) { return "back" }
+        $Cleaned = Sanitize-TargetString $RawInput
+
+        if ($Cleaned.ToLower() -eq "b" -or $Cleaned.ToLower() -eq "back") { return "back" }
+
+        $Segments = $Cleaned -split '[,\|]'
+        $AllValid = $true
+
+        foreach ($Seg in $Segments) {
+            $Target = $Seg.Trim()
+            if ([string]::IsNullOrWhiteSpace($Target)) { continue }
+
+            # Match CIDR block, Range notation, or Standalone IP
+            if ($Target -match '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2}|-[0-9]{1,3})?$') {
+                $Octets = $Target -split '[\./-]'
+                foreach ($Octet in $Octets[0..3]) {
+                    if ([int]$Octet -gt 255) { $AllValid = $false }
+                }
+            } else {
+                $AllValid = $false
+            }
+        }
+
+        if ($AllValid) { return $Cleaned }
+        Write-Host "[!] Invalid scope configuration. Formats allowed: 10.0.0.1, 192.168.1.0/24, or 172.16.1.5-250" -ForegroundColor Red
     }
 }
 
@@ -244,7 +311,7 @@ function Invoke-PortScanner {
                                 $null = $ScanResults.Add($RowObj)
                             }
                         } else {
-                            Write-Host "[*] ALIVE (ICMP): $($item.IPAddress)" -ForegroundColor Gray
+                            Write-Host "[*] ALIVE (Ping Only): $($item.IPAddress)" -ForegroundColor Gray
                             $RowObj = [PSCustomObject]@{
                                 IPAddress  = $item.IPAddress
                                 HostStatus = "ONLINE"
@@ -482,9 +549,20 @@ function Invoke-BannerGrabber {
         return
     }
 
+    # AUTOMATED DNS RESOLUTION LOOKUP
     $IP = $Target.Trim()
+    if ($IP -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+        try {
+            $ResolvedList = [System.Net.Dns]::GetHostAddresses($IP)
+            $IP = $ResolvedList[0].IPAddressToString
+            Write-Host "[*] Hostname resolved successfully to underlying IP address: $IP" -ForegroundColor DarkGray
+        } catch {
+            Write-Host "[!] DNS Resolution Error: Could not resolve the host target '$IP'." -ForegroundColor Red
+            return
+        }
+    }
+    
     $PortNum = [int]$Port.Trim()
-
     Write-Host "Connecting to $IP on port $PortNum... (Timeout: 2 seconds)" -ForegroundColor Cyan
 
     $client = New-Object System.Net.Sockets.TcpClient
@@ -590,11 +668,15 @@ function Invoke-MtuCalculator {
         return
     }
 
-    if ($Target -match '\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b') {
-        $CleanedHost = $Matches[0]
-    } else {
-        Write-Host "[CRITICAL ERROR]: The input '$Target' does not contain a valid IPv4 address!" -ForegroundColor Red
-        return
+    # AUTOMATED DNS RESOLUTION LOOKUP
+    $CleanedHost = $Target.Trim()
+    if ($CleanedHost -notmatch '^(\d{1,3}\.){3}\d{1,3}$') {
+        try {
+            $CleanedHost = [System.Net.Dns]::GetHostAddresses($CleanedHost)[0].IPAddressToString
+        } catch {
+            Write-Host "[CRITICAL ERROR]: Could not run MTU lookup. Unable to resolve '$Target'." -ForegroundColor Red
+            return
+        }
     }
 
     Write-Host "`nChecking reachability for: $CleanedHost..." -NoNewline
@@ -755,7 +837,6 @@ function Show-Menu-Layout {
 }
 
 while ($true) {
-    # Clear out trailing keystrokes from prior scans
     while ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true) }
 
     $Host.UI.RawUI.WindowTitle = $Global:OriginalTitle
@@ -788,12 +869,8 @@ while ($true) {
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
             
             do {
-                # USING NATIVE READ-HOST: History recall via Up-Arrow works natively again.
-                $TargetInput = Read-Host "Enter Subnet/Range (or type 'b' to go back)"
-                
-                if ($TargetInput.Trim().ToLower() -eq "b" -or $TargetInput.Trim().ToLower() -eq "back" -or [string]::IsNullOrWhiteSpace($TargetInput)) { 
-                    break 
-                }
+                $TargetInput = Get-ValidNetworkInput -PromptMessage "Enter Subnet/Range (or type 'b' to go back)"
+                if ($TargetInput -eq "back") { break }
                 
                 $ScanStatus = Invoke-PortScanner -IPInput $TargetInput
                 if (-not $ScanStatus) { 
@@ -810,11 +887,8 @@ while ($true) {
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
             
             do {
-                $TargetInput = Read-Host "Enter Discovery Target Subnet/Range (or type 'b' to go back)"
-                
-                if ($TargetInput.Trim().ToLower() -eq "b" -or $TargetInput.Trim().ToLower() -eq "back" -or [string]::IsNullOrWhiteSpace($TargetInput)) { 
-                    break 
-                }
+                $TargetInput = Get-ValidNetworkInput -PromptMessage "Enter Discovery Target Subnet/Range (or type 'b' to go back)"
+                if ($TargetInput -eq "back") { break }
 
                 $ScanStatus = Invoke-PortScannerDte -IPInput $TargetInput
                 if (-not $ScanStatus) { 
@@ -829,37 +903,49 @@ while ($true) {
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
             Write-Host "Launching Banner Grabber..." -ForegroundColor Green
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $T = Read-Host "Enter Target IP"
-            $P = Read-Host "Enter Port Number"
-            Invoke-BannerGrabber -Target $T -Port $P
-            Read-Host "`nPress Enter to return to menu..."
+            
+            $T = Get-ValidSingleTarget -PromptMessage "Enter Target IP/Hostname"
+            if ($T -ne "back") {
+                $P = Read-Host "Enter Port Number"
+                Invoke-BannerGrabber -Target $T -Port $P
+                Read-Host "`nPress Enter to return to menu..."
+            }
         }
         "4" {
             Show-Menu-Layout
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
             Write-Host "Launching MTU Analyzer..." -ForegroundColor Green
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $T = Read-Host "Enter Target IP for MTU Sweep"
-            Invoke-MtuCalculator -Target $T
-            Read-Host "`nPress Enter to return to menu..."
+            
+            $T = Get-ValidSingleTarget -PromptMessage "Enter Target IP/Hostname for MTU Sweep"
+            if ($T -ne "back") {
+                Invoke-MtuCalculator -Target $T
+                Read-Host "`nPress Enter to return to menu..."
+            }
         }
         "5" {
             Show-Menu-Layout
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
             Write-Host "Launching Quick Ping..." -ForegroundColor Green
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $T = Read-Host "Enter Target IP/Hostname for Quick Ping"
-            Invoke-QuickPing -Target $T
-            Read-Host "`nDiagnostic sequence concluded. Press Enter to return to menu..."
+            
+            $T = Get-ValidSingleTarget -PromptMessage "Enter Target IP/Hostname for Quick Ping"
+            if ($T -ne "back") {
+                Invoke-QuickPing -Target $T
+                Read-Host "`nDiagnostic sequence concluded. Press Enter to return to menu..."
+            }
         }
         "6" {
             Show-Menu-Layout
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
             Write-Host "Launching Continuous Ping..." -ForegroundColor Green
             Write-Host "--------------------------------------------------------" -ForegroundColor Green
-            $T = Read-Host "Enter Target IP/Hostname for Continuous Tracking"
-            Invoke-ContinuousPing -Target $T
-            Read-Host "`nPersistent tunnel stopped. Press Enter to return to menu..."
+            
+            $T = Get-ValidSingleTarget -PromptMessage "Enter Target IP/Hostname for Continuous Tracking"
+            if ($T -ne "back") {
+                Invoke-ContinuousPing -Target $T
+                Read-Host "`nPersistent tunnel stopped. Press Enter to return to menu..."
+            }
         }
         "7" {
             Clear-Host
